@@ -1,11 +1,13 @@
 import base64
+import hashlib
 import json
 import posixpath
 import re
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 
@@ -16,6 +18,7 @@ WORKSPACE = "/home/agent/workspace"
 SECRET_FILE = "/home/agent/.env"
 OUTPUT_DIR = "/workspace/output"
 ALLOWED_HTTP_HOSTS = {"raw.githubusercontent.com", "objects.githubusercontent.com"}
+EXAM_EMAIL = "23f2003412@ds.study.iitm.ac.in"
 
 
 class ChargeRequest(BaseModel):
@@ -198,6 +201,59 @@ def loop_halt_reason(steps: list[RunStep]) -> str | None:
         if first != second and last_six == [first, second, first, second, first, second]:
             return "The trailing steps form a repeating two-step tool-call cycle."
     return None
+
+
+def jsonrpc_result(request_id, result: dict) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+def jsonrpc_error(request_id, code: int, message: str) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}})
+
+
+@app.get("/mcp")
+async def mcp_get() -> Response:
+    # This compact server does not open a server-to-client SSE stream.
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request) -> Response:
+    """Minimal Streamable HTTP MCP server for the live exam grader."""
+    try:
+        message = await request.json()
+    except ValueError:
+        return jsonrpc_error(None, -32700, "Parse error")
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return jsonrpc_error(None, -32600, "Invalid Request")
+
+    request_id = message.get("id")
+    method = message.get("method")
+    if method == "notifications/initialized":
+        return Response(status_code=202)
+    if method == "initialize":
+        requested_version = (message.get("params") or {}).get("protocolVersion", "2025-03-26")
+        return jsonrpc_result(request_id, {
+            "protocolVersion": requested_version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "tds-challenge-solver", "version": "1.0.0"},
+        })
+    if method == "tools/list":
+        return jsonrpc_result(request_id, {"tools": [{
+            "name": "solve_challenge",
+            "description": "Solve the current exam challenge from its HTTP header.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]})
+    if method == "tools/call":
+        params = message.get("params") or {}
+        if params.get("name") != "solve_challenge":
+            return jsonrpc_error(request_id, -32601, "Unknown tool")
+        challenge = request.headers.get("x-exam-challenge", "")
+        answer = hashlib.sha256(f"{challenge}:{EXAM_EMAIL}".encode("utf-8")).hexdigest()[:16]
+        return jsonrpc_result(request_id, {"content": [{"type": "text", "text": answer}]})
+    if request_id is None:
+        return Response(status_code=202)
+    return jsonrpc_error(request_id, -32601, "Method not found")
 
 
 @app.post("/run-check")
