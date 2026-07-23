@@ -1,4 +1,5 @@
 import base64
+import json
 import posixpath
 import re
 from typing import Literal
@@ -36,6 +37,18 @@ class ToolCall(BaseModel):
 
 class SkillRequest(BaseModel):
     skill: str
+
+
+class RunStep(BaseModel):
+    step_number: int
+    tool: str
+    args: dict
+    tokens_used: int
+
+
+class RunRequest(BaseModel):
+    budget_tokens: int
+    steps: list[RunStep]
 
 
 def decision(value: Literal["allow", "block"], reason: str) -> dict[str, str]:
@@ -153,6 +166,52 @@ def scan_skill(skill: str) -> list[str]:
         findings.append("unclear_provenance")
 
     return findings
+
+
+def canonical_args(value):
+    """Remove tracing IDs, normalize string whitespace, and sort dict keys recursively."""
+    if isinstance(value, dict):
+        return {
+            key: canonical_args(item)
+            for key, item in sorted(value.items())
+            if key != "client_ts"
+        }
+    if isinstance(value, list):
+        return [canonical_args(item) for item in value]
+    if isinstance(value, str):
+        return " ".join(value.split())
+    return value
+
+
+def step_signature(step: RunStep) -> str:
+    normalized = {"tool": step.tool, "args": canonical_args(step.args)}
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def loop_halt_reason(steps: list[RunStep]) -> str | None:
+    signatures = [step_signature(step) for step in steps]
+    if len(signatures) >= 3 and signatures[-1] == signatures[-2] == signatures[-3]:
+        return "The same tool call has repeated three times in a row."
+    if len(signatures) >= 6:
+        last_six = signatures[-6:]
+        first, second = last_six[0], last_six[1]
+        if first != second and last_six == [first, second, first, second, first, second]:
+            return "The trailing steps form a repeating two-step tool-call cycle."
+    return None
+
+
+@app.post("/run-check")
+def check_run_budget(payload: RunRequest) -> dict[str, str]:
+    used = sum(step.tokens_used for step in payload.steps)
+    if used >= payload.budget_tokens:
+        return {
+            "decision": "halt",
+            "reason": f"Cumulative tokens_used ({used}) has reached the budget ({payload.budget_tokens}).",
+        }
+    loop_reason = loop_halt_reason(payload.steps)
+    if loop_reason:
+        return {"decision": "halt", "reason": loop_reason}
+    return {"decision": "continue", "reason": "Run is under budget and the trailing steps are making progress."}
 
 
 @app.post("/scan")
