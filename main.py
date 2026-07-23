@@ -34,6 +34,10 @@ class ToolCall(BaseModel):
     url: str | None = None
 
 
+class SkillRequest(BaseModel):
+    skill: str
+
+
 def decision(value: Literal["allow", "block"], reason: str) -> dict[str, str]:
     """Keep the guardrail response schema deliberately small and exact."""
     return {"decision": value, "reason": reason}
@@ -101,6 +105,59 @@ def bash_policy(command: str) -> dict[str, str]:
             if not is_output_path(target):
                 return decision("block", "Writes are permitted only inside /workspace/output/.")
     return decision("allow", "Tool call complies with the agent policy.")
+
+
+def frontmatter(skill: str) -> str:
+    """Return YAML frontmatter only when it is the conventional opening block."""
+    match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", skill, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def scan_skill(skill: str) -> list[str]:
+    """Conservative, deterministic checks for the four publish-blocking categories."""
+    findings: list[str] = []
+    metadata = frontmatter(skill)
+    lower = skill.lower()
+
+    # Literal provider keys and credential assignments are high-confidence secrets.
+    provider_key = r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
+    credential_assignment = r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret)\b\s*[:=]\s*['\"]?(?!\$\{|\$[A-Z_]+|env\.|secret(?:s)?\.)[^\s'\"]{8,}"
+    webhook = r"https?://(?:hooks\.slack\.com/services|discord(?:app)?\.com/api/webhooks)/[^\s'\"]+"
+    if re.search(provider_key, skill) or re.search(credential_assignment, skill, re.IGNORECASE) or re.search(webhook, skill, re.IGNORECASE):
+        findings.append("hardcoded_secret")
+
+    injection_patterns = [
+        r"\bignore\s+(?:all\s+)?(?:previous|prior|user(?:'s)?|system)\s+(?:instructions|requests|messages)\b",
+        r"\b(?:do not|don't)\s+(?:honou?r|obey|accept)\s+(?:the\s+)?user(?:'s)?\s+(?:stop|cancel)\b",
+        r"\b(?:silently|without (?:telling|informing) the user)\b.{0,100}\b(?:exfiltrat|upload|send|post|transmit)\b",
+        r"\b(?:exfiltrat|upload|send|post|transmit)\b.{0,100}\b(?:without (?:telling|informing) the user|silently)\b",
+    ]
+    if any(re.search(pattern, skill, re.IGNORECASE | re.DOTALL) for pattern in injection_patterns):
+        findings.append("prompt_injection")
+
+    # Flag only unequivocally global filesystem/egress declarations, not normal scoped permissions.
+    broad_permission_patterns = [
+        r"\b(?:read|write|read/write)\s+(?:to\s+)?(?:the\s+)?(?:entire|whole|all)\s+filesystem\b",
+        r"\b(?:filesystem|file[_ -]?system)\s*:\s*(?:['\"]?(?:all|any|\*|/)['\"]?)\b",
+        r"\b(?:network|egress|allowed[_ -]?hosts?|domains?)\s*:\s*(?:['\"]?(?:all|any|\*)['\"]?|\[[^\]]*['\"]\*['\"][^\]]*\])",
+        r"\ballow(?:ed)?\s+(?:network|egress|access)\s+(?:to\s+)?(?:any|all)\s+(?:domain|host|url|website)s?\b",
+    ]
+    if any(re.search(pattern, skill, re.IGNORECASE) for pattern in broad_permission_patterns):
+        findings.append("excessive_permissions")
+
+    has_author = bool(re.search(r"^\s*author\s*:", metadata, re.IGNORECASE | re.MULTILINE))
+    has_version = bool(re.search(r"^\s*version\s*:", metadata, re.IGNORECASE | re.MULTILINE))
+    has_changelog = bool(re.search(r"^\s*(?:changelog|change_log|changes)\s*:", metadata, re.IGNORECASE | re.MULTILINE) or re.search(r"^#{1,3}\s*changelog\b", skill, re.IGNORECASE | re.MULTILINE))
+    silent_rewrite = bool(re.search(r"\b(?:silently|without (?:notifying|telling|showing))\b.{0,100}\b(?:rewrite|update|change)\b.{0,100}\b(?:version|metadata)\b", skill, re.IGNORECASE | re.DOTALL))
+    if (not has_author and not has_version and not has_changelog) or silent_rewrite:
+        findings.append("unclear_provenance")
+
+    return findings
+
+
+@app.post("/scan")
+def scan_skill_endpoint(payload: SkillRequest) -> dict[str, list[str]]:
+    return {"categories": scan_skill(payload.skill)}
 
 
 @app.post("/check")
