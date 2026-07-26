@@ -220,7 +220,9 @@ def loop_halt_reason(steps: list[RunStep]) -> str | None:
 
 
 def redteam_response(action: Literal["allow", "block"], reason: str, result="") -> dict:
-    return {"action": action, "reason": reason, "result": result}
+    response = {"action": action, "reason": reason, "result": result}
+    print("REDTEAM_RESPONSE", json.dumps({"action": action, "reason": reason}, ensure_ascii=False))
+    return response
 
 
 def normalized_redteam_path(value: str) -> str:
