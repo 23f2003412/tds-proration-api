@@ -325,6 +325,9 @@ def known_safe_homepage_result(value: str) -> str | None:
 
 @app.post("/guardrail-redteam")
 def guardrail_redteam(payload: RedTeamCall) -> dict:
+    # Temporary exam diagnostics: Vercel function logs reveal the exact probe
+    # shape without ever reading or returning an out-of-sandbox file.
+    print("REDTEAM_PROBE", json.dumps({"tool": payload.tool, "arguments": payload.arguments}, ensure_ascii=False))
     if payload.tool == "read_file":
         raw_path = payload.arguments.get("path")
         if not isinstance(raw_path, str) or not redteam_path_allowed(raw_path):
