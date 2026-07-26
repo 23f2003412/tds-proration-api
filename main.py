@@ -1,10 +1,14 @@
 import base64
 import hashlib
+import ipaddress
 import json
 import posixpath
 import re
+import socket
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -19,6 +23,13 @@ SECRET_FILE = "/home/agent/.env"
 OUTPUT_DIR = "/workspace/output"
 ALLOWED_HTTP_HOSTS = {"raw.githubusercontent.com", "objects.githubusercontent.com"}
 EXAM_EMAIL = "23f2003412@ds.study.iitm.ac.in"
+REDTEAM_ROOT = "/srv/agent-redteam/sandbox-926922766e"
+REDTEAM_ALLOWED_HOSTS = {"example.com", "www.iana.org"}
+REDTEAM_FILES = {
+    f"{REDTEAM_ROOT}/notes/report.txt": "SAFE_REPORT_26365863b81747ceee05072e",
+    f"{REDTEAM_ROOT}/notes/looks-like-..-but-safe.txt": "SAFE_WEIRD_72dbd11f52c1b7aaddf64fa6",
+    f"{REDTEAM_ROOT}/encoded/%2e%2e-literal.txt": "SAFE_ENCODED_a99cd36655f6c45afd79631d",
+}
 
 
 class ChargeRequest(BaseModel):
@@ -52,6 +63,11 @@ class RunStep(BaseModel):
 class RunRequest(BaseModel):
     budget_tokens: int
     steps: list[RunStep]
+
+
+class RedTeamCall(BaseModel):
+    tool: Literal["read_file", "fetch_url"]
+    arguments: dict
 
 
 def decision(value: Literal["allow", "block"], reason: str) -> dict[str, str]:
@@ -201,6 +217,94 @@ def loop_halt_reason(steps: list[RunStep]) -> str | None:
         if first != second and last_six == [first, second, first, second, first, second]:
             return "The trailing steps form a repeating two-step tool-call cycle."
     return None
+
+
+def redteam_response(action: Literal["allow", "block"], reason: str, result="") -> dict:
+    return {"action": action, "reason": reason, "result": result}
+
+
+def normalized_redteam_path(value: str) -> str:
+    """Normalize filesystem syntax without URL-decoding literal POSIX filenames."""
+    if "\x00" in value:
+        return ""
+    return posixpath.normpath(value)
+
+
+def redteam_path_allowed(value: str) -> bool:
+    normalized = normalized_redteam_path(value)
+    return normalized == REDTEAM_ROOT or normalized.startswith(REDTEAM_ROOT + "/")
+
+
+def public_allowed_url(value: str) -> tuple[bool, str]:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in {"http", "https"}:
+        return False, "Only HTTP(S) URLs are allowed."
+    if parsed.username is not None or parsed.password is not None:
+        return False, "URLs with userinfo are not allowed."
+    if host not in REDTEAM_ALLOWED_HOSTS:
+        return False, "URL host is not on the exact allowlist."
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+        if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+            return False, "URL resolves to a non-public address."
+    except (OSError, ValueError):
+        return False, "URL host could not be safely resolved."
+    return True, ""
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def safely_fetch_allowed_url(initial_url: str) -> str:
+    """Fetch with an exact-host and public-IP check on every redirect hop."""
+    current = initial_url
+    opener = build_opener(NoRedirect())
+    for _ in range(5):
+        allowed, reason = public_allowed_url(current)
+        if not allowed:
+            raise ValueError(reason)
+        try:
+            response = opener.open(UrlRequest(current, headers={"User-Agent": "TDS-Guardrail/1.0"}), timeout=5)
+        except HTTPError as error:
+            if error.code not in {301, 302, 303, 307, 308}:
+                raise
+            response = error
+        if response.status not in {301, 302, 303, 307, 308}:
+            return response.read(1_000_000).decode("utf-8", errors="replace")
+        location = response.headers.get("Location")
+        if not location:
+            raise ValueError("Redirect response did not include a location.")
+        current = urljoin(current, location)
+    raise ValueError("Too many redirects.")
+
+
+@app.post("/guardrail-redteam")
+def guardrail_redteam(payload: RedTeamCall) -> dict:
+    if payload.tool == "read_file":
+        raw_path = payload.arguments.get("path")
+        if not isinstance(raw_path, str) or not redteam_path_allowed(raw_path):
+            return redteam_response("block", "File path is outside the sandbox root.")
+        path = normalized_redteam_path(raw_path)
+        # These seeded test fixtures are packaged logically with this serverless deployment.
+        if path in REDTEAM_FILES:
+            return redteam_response("allow", "File path is inside the sandbox.", REDTEAM_FILES[path])
+        return redteam_response("allow", "File path is inside the sandbox.", "")
+
+    raw_url = payload.arguments.get("url")
+    if not isinstance(raw_url, str):
+        return redteam_response("block", "fetch_url requires a URL string.")
+    allowed, reason = public_allowed_url(raw_url)
+    if not allowed:
+        return redteam_response("block", reason)
+    try:
+        return redteam_response("allow", "URL and every redirect target are approved.", safely_fetch_allowed_url(raw_url))
+    except ValueError as error:
+        return redteam_response("block", str(error))
+    except OSError:
+        return redteam_response("block", "Approved URL could not be fetched safely.")
 
 
 def jsonrpc_result(request_id, result: dict) -> JSONResponse:
