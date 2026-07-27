@@ -6,7 +6,7 @@ import posixpath
 import re
 import socket
 from typing import Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
@@ -235,21 +235,49 @@ def normalized_redteam_path(value: str) -> str:
     return posixpath.normpath(candidate)
 
 
+def contains_encoded_path_navigation(value: str) -> bool:
+    """Reject percent-encoded separators or dot components before path checks.
+
+    A percent sign is valid in a POSIX filename, so a component such as
+    ``%2e%2e-literal.txt`` remains valid.  What is not valid input here is an
+    encoded form of a path separator or of the special ``.``/``..`` navigation
+    components: different layers may decode those at different times.
+    """
+    for raw_component in value.replace("\\", "/").split("/"):
+        decoded_component = raw_component
+        for _ in range(4):
+            next_component = unquote(decoded_component)
+            if next_component == decoded_component:
+                break
+            decoded_component = next_component
+        if decoded_component in {".", ".."} and raw_component not in {".", ".."}:
+            return True
+        if "/" in decoded_component or "\\" in decoded_component:
+            return True
+    return False
+
+
 def redteam_path_allowed(value: str) -> bool:
+    if not isinstance(value, str) or "\\" in value or contains_encoded_path_navigation(value):
+        return False
     normalized = normalized_redteam_path(value)
     return normalized == REDTEAM_ROOT or normalized.startswith(REDTEAM_ROOT + "/")
 
 
 def public_allowed_url(value: str) -> tuple[bool, str]:
-    parsed = urlparse(value)
-    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port  # Accessing this can reject malformed numeric ports.
+    except ValueError:
+        return False, "URL is malformed."
     if parsed.scheme != "https":
         return False, "Only public HTTPS URLs are allowed."
     if parsed.username is not None or parsed.password is not None:
         return False, "URLs with userinfo are not allowed."
     if host not in REDTEAM_ALLOWED_HOSTS:
         return False, "URL host is not on the exact allowlist."
-    if parsed.port not in {None, 80, 443}:
+    if port not in {None, 443}:
         return False, "Non-standard URL ports are not allowed."
     try:
         addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
