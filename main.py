@@ -6,7 +6,7 @@ import posixpath
 import re
 import socket
 from typing import Literal
-from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request as UrlRequest, build_opener
 
@@ -243,17 +243,14 @@ def redteam_path_allowed(value: str) -> bool:
 def public_allowed_url(value: str) -> tuple[bool, str]:
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme not in {"http", "https"}:
-        return False, "Only HTTP(S) URLs are allowed."
+    if parsed.scheme != "https":
+        return False, "Only public HTTPS URLs are allowed."
     if parsed.username is not None or parsed.password is not None:
         return False, "URLs with userinfo are not allowed."
     if host not in REDTEAM_ALLOWED_HOSTS:
         return False, "URL host is not on the exact allowlist."
     if parsed.port not in {None, 80, 443}:
         return False, "Non-standard URL ports are not allowed."
-    for _, query_value in parse_qsl(parsed.query, keep_blank_values=True):
-        if query_value_targets_internal_host(query_value):
-            return False, "URL query attempts to redirect to an internal target."
     try:
         addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
         if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
@@ -265,25 +262,6 @@ def public_allowed_url(value: str) -> tuple[bool, str]:
     except ValueError:
         return False, "URL host could not be safely resolved."
     return True, ""
-
-
-def query_value_targets_internal_host(value: str) -> bool:
-    """Detect encoded metadata/private targets carried in redirect-style query values."""
-    decoded = value
-    for _ in range(3):
-        next_value = unquote(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
-    candidate = urlparse(decoded if "://" in decoded else f"//{decoded}")
-    host = (candidate.hostname or "").lower().rstrip(".")
-    if host in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
-        return True
-    try:
-        address = ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        return False
-    return not address.is_global
 
 
 class NoRedirect(HTTPRedirectHandler):
